@@ -2,7 +2,10 @@
 'use server';
 
 import { createClient } from '@/utils/supabase/server';
-import { FormaPagamento } from '@/types/database';
+import { MercadoPagoConfig, Payment } from 'mercadopago';
+
+const accessToken = process.env.MERCADO_PAGO_ACCESS_TOKEN;
+const mpClient = accessToken ? new MercadoPagoConfig({ accessToken }) : null;
 
 interface ItemPedidoInput {
   item_cardapio_id: string;
@@ -10,115 +13,121 @@ interface ItemPedidoInput {
   preco_unitario: number;
 }
 
-interface DadosClienteInput {
-  nome: string;
-  telefone: string;
-  endereco: {
-    rua: string;
-    numero: string;
-    bairro: string;
-    cidade: string;
-    cep: string;
-  };
+interface PayloadRequisicaoMP {
+  token?: string;
+  issuer_id?: string;
+  payment_method_id: string;
+  transaction_amount: number;
+  installments?: number;
+  payer: { email: string; nome: string; telefone: string };
+  slug: string;
+  dadosCliente: any;
+  itens: ItemPedidoInput[];
+  fb_click_id: string | null;
 }
 
-export async function processarPedidoCheckout(
-  slug: string,
-  formaPagamento: FormaPagamento,
-  dadosCliente: DadosClienteInput,
-  itens: ItemPedidoInput[],
-  valorTotal: number
-) {
+export async function criarPedidoEMercadoPago(dados: PayloadRequisicaoMP) {
   try {
     const supabase = await createClient();
 
-    if (!slug || itens.length === 0) {
-      return { success: false, error: 'Dados do checkout incompletos.' };
+    if (!dados.slug || dados.itens.length === 0 || !mpClient) {
+      return { success: false, error: 'Configurações de infraestrutura ausentes.' };
     }
 
-    // 1. Descobre o restaurante através do slug da URL
+    // 1. Busca o Restaurante
     const { data: restaurante, error: errRestaurante } = await supabase
       .from('restaurantes')
       .select('id')
-      .eq('slug', slug)
+      .eq('slug', dados.slug)
       .maybeSingle();
 
     if (errRestaurante || !restaurante) {
-      return { success: false, error: 'Restaurante inválido ou indisponível.' };
+      return { success: false, error: 'Restaurante não localizado ou inativo.' };
     }
 
-    // 2. Cria o registro mestre do pedido (Status PENDENTE)
+    // 2. Cálculo Otimizado de CMV em Lote
+    const itemIds = dados.itens.map(i => i.item_cardapio_id);
+    const { data: composicoes } = await supabase
+      .from('composicao_produto')
+      .select('item_cardapio_id, quantidade_necessaria, insumos(custo_unitario)')
+      .in('item_cardapio_id', itemIds);
+
+    let cmvTotalCalculado = 0;
+    if (composicoes) {
+      const qtdPorItem = new Map(dados.itens.map(i => [i.item_cardapio_id, i.quantidade]));
+      for (const comp of composicoes) {
+        const qtdVendida = qtdPorItem.get(comp.item_cardapio_id) || 0;
+        const custoInsumo = Number((comp.insumos as any)?.custo_unitario || 0);
+        cmvTotalCalculado += Number(comp.quantidade_necessaria) * qtdVendida * custoInsumo;
+      }
+    }
+
+    // 3. Criação Isolada do Pedido Mestre
     const { data: novoPedido, error: errPedido } = await supabase
       .from('pedidos')
       .insert([{
         restaurante_id: restaurante.id,
         status: 'PENDENTE',
-        valor_total: valorTotal,
-        forma_pagamento: formaPagamento,
-        dados_cliente: dadosCliente
+        valor_total: dados.transaction_amount,
+        forma_pagamento: dados.payment_method_id === 'pix' ? 'PIX' : 'CARTAO',
+        dados_cliente: dados.dadosCliente,
+        fb_click_id: dados.fb_click_id
       }])
-      .select()
+      .select('id')
       .single();
 
     if (errPedido || !novoPedido) {
-      console.error('Erro ao criar pedido mestre:', errPedido);
-      return { success: false, error: 'Falha ao processar as informações do pedido.' };
+      throw new Error(`Erro ao instanciar pedido: ${errPedido?.message}`);
     }
 
-    // 3. Cadastra as linhas de itens do pedido
-    const linhasItens = itens.map(item => ({
+    // 4. Inserção dos Itens Relacionados
+    const linhasItens = dados.itens.map(item => ({
       pedido_id: novoPedido.id,
       item_cardapio_id: item.item_cardapio_id,
       quantidade: item.quantidade,
       preco_unitario: item.preco_unitario
     }));
 
-    const { error: errItens } = await supabase
-      .from('itens_pedido')
-      .insert(linhasItens);
+    const { error: errItens } = await supabase.from('itens_pedido').insert(linhasItens);
+    if (errItens) throw new Error('Falha crítica ao vincular itens ao pedido mestre.');
 
-    if (errItens) {
-      console.error('Erro ao registrar linhas do pedido:', errItens);
-      return { success: false, error: 'Erro ao registrar itens do pedido.' };
+    // 5. Disparo Transparente Gateway (Mercado Pago API v1)
+    const payment = new Payment(mpClient);
+    const corpoRequisicao: any = {
+      transaction_amount: Number(dados.transaction_amount),
+      description: `Pedido #${novoPedido.id.slice(0,8)} - AceleraFood`,
+      payment_method_id: dados.payment_method_id,
+      payer: { email: dados.payer.email.trim() },
+      notification_url: `${process.env.NEXT_PUBLIC_URL || 'https://ngrok-free.app'}/api/webhooks/pagamentos`,
+      metadata: {
+        pedido_id: novoPedido.id,
+        restaurante_id: restaurante.id,
+        cmv_total: cmvTotalCalculado
+      },
+    };
+
+    if (dados.payment_method_id !== 'pix') {
+      corpoRequisicao.token = dados.token;
+      corpoRequisicao.issuer_id = dados.issuer_id;
+      corpoRequisicao.installments = Number(dados.installments);
     }
 
-    // 4. MÁGICA DO ESTOQUE DEDUTIVO: Puxa todas as receitas necessárias em lote (Fim do N+1)
-    const itemIds = itens.map(i => i.item_cardapio_id);
-    const { data: composicoes, error: errCompo } = await supabase
-      .from('composicao_produto')
-      .select('item_cardapio_id, insumo_id, quantidade_necessaria')
-      .in('item_cardapio_id', itemIds);
+    const respostaMP = await payment.create({ body: corpoRequisicao });
 
-    if (!errCompo && composicoes) {
-      // Mapeia os inputs de itens para busca rápida em O(1)
-      const quantidadePorItem = new Map(itens.map(i => [i.item_cardapio_id, i.quantidade]));
-
-      for (const comp of composicoes) {
-        const qtdVendidaDoProduto = quantidadePorItem.get(comp.item_cardapio_id) || 0;
-        const quantidadeTotalDeduzir = Number(comp.quantidade_necessaria) * qtdVendidaDoProduto;
-        
-        if (quantidadeTotalDeduzir > 0) {
-          // Executa a subtração atômica direta via Procedure RPC armazenada no banco
-          await supabase.rpc('deduzir_estoque_insumo', {
-            p_insumo_id: comp.insumo_id,
-            p_quantidade: quantidadeTotalDeduzir
-          });
-        }
-      }
+    if (respostaMP && respostaMP.id) {
+      const dadosPix = respostaMP.point_of_interaction?.transaction_data;
+      return {
+        success: true,
+        pedidoId: novoPedido.id,
+        pixCopiaECola: dadosPix?.qr_code || null,
+        pixQrCodeBase64: dadosPix?.qr_code_base64 || null,
+      };
     }
 
-    // 5. ATUALIZAÇÃO DO FUNIL DE CRESCIMENTO (Destaque de Lucratividade)
-    const hoje = new Date().toISOString().split('T')[0];
-    
-    // Incremento atômico de compras concluídas chamando a função nativa RPC correspondente
-    await supabase.rpc('incrementar_compras_funil', {
-      p_restaurante_id: restaurante.id,
-      p_data: hoje
-    });
+    return { success: false, error: 'O gateway rejeitou os parâmetros de cobrança.' };
 
-    return { success: true, pedidoId: novoPedido.id };
   } catch (error: any) {
-    console.error('Erro crítico durante fluxo de processarPedidoCheckout:', error);
-    return { success: false, error: error.message || 'Falha catastrófica no checkout.' };
+    console.error('[Action Error]:', error);
+    return { success: false, error: error.message || 'Erro inesperado no motor de checkout.' };
   }
 }
