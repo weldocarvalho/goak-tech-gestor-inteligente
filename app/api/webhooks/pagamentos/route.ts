@@ -1,5 +1,9 @@
 import { NextResponse } from 'next/server';
 import { createWebhookAdminClient } from '@/utils/supabase/webhook';
+import {
+  ambienteMercadoPagoEhSandbox,
+  obterTokenMercadoPagoTesteConfigurado,
+} from '@/utils/mercado-pago';
 
 const MP_API_BASE = 'https://api.mercadopago.com';
 
@@ -14,6 +18,7 @@ interface MetadataPedido {
   dadosCliente?: string;
   itens?: string;
   metodoPagamento?: 'PIX' | 'CARTAO';
+  ambiente?: 'production' | 'sandbox';
 }
 
 interface ItemCardapioPrecificado {
@@ -90,17 +95,35 @@ export async function POST(request: Request) {
     }
 
     const supabase = createWebhookAdminClient();
-    const { data: integracao, error: errIntegracao } = await supabase
-      .from('restaurante_integracoes_pagamento')
-      .select('access_token, connection_status')
-      .eq('restaurante_id', restauranteId)
-      .maybeSingle();
+    const tokenTeste = obterTokenMercadoPagoTesteConfigurado();
+    let accessTokenParaConsulta = '';
 
-    if (errIntegracao || !integracao?.access_token || integracao.connection_status !== 'conectado') {
-      return NextResponse.json({ error: 'Integração Mercado Pago indisponível.' }, { status: 409 });
+    if (ambienteMercadoPagoEhSandbox() && tokenTeste) {
+      accessTokenParaConsulta = tokenTeste;
+    } else {
+      const { data: integracao, error: errIntegracao } = await supabase
+        .from('restaurante_integracoes_pagamento')
+        .select('access_token, connection_status')
+        .eq('restaurante_id', restauranteId)
+        .maybeSingle();
+
+      if (errIntegracao || !integracao?.access_token || integracao.connection_status !== 'conectado') {
+        console.error('❌ Webhook sem token de integração válido:', {
+          restauranteId,
+          errIntegracao,
+          connection_status: integracao?.connection_status,
+        });
+        return NextResponse.json({ error: 'Integração Mercado Pago indisponível.' }, { status: 409 });
+      }
+
+      accessTokenParaConsulta = integracao.access_token;
     }
 
-    const pagamento = await buscarPagamentoMercadoPago(integracao.access_token, String(dataId));
+    if (!accessTokenParaConsulta) {
+      return NextResponse.json({ error: 'Token do Mercado Pago indisponível para consulta.' }, { status: 409 });
+    }
+
+    const pagamento = await buscarPagamentoMercadoPago(accessTokenParaConsulta, String(dataId));
     if (pagamento.status !== 'approved') {
       return NextResponse.json({ received: true });
     }
@@ -160,6 +183,10 @@ export async function POST(request: Request) {
       .maybeSingle();
 
     if (pedidoExistente.data) {
+      console.log('ℹ️ Webhook ignorado: pagamento já conciliado.', {
+        restauranteId,
+        paymentId: String(pagamento.id),
+      });
       return NextResponse.json({ received: true });
     }
 

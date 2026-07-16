@@ -21,9 +21,6 @@ after(async () => {
 })
 
 test('bloco 5: webhook/pagamento com validações defensivas', async () => {
-  const webhookConfigurado =
-    Boolean(process.env.STRIPE_SECRET_KEY) && Boolean(process.env.STRIPE_WEBHOOK_SECRET)
-
   const getWebhook = await fetch(`${baseUrl}/api/webhooks/pagamentos`, {
     method: 'GET',
     redirect: 'manual',
@@ -37,40 +34,22 @@ test('bloco 5: webhook/pagamento com validações defensivas', async () => {
   })
 
   const bodySemAssinatura = await postSemAssinatura.json()
-  if (webhookConfigurado) {
-    assert.equal(postSemAssinatura.status, 400)
-    assert.equal(
-      String(bodySemAssinatura.error || '').includes('Assinatura'),
-      true,
-      'Webhook configurado deve rejeitar payload sem assinatura'
-    )
-  } else {
-    assert.equal(postSemAssinatura.status, 500)
-    assert.equal(
-      String(bodySemAssinatura.error || '').includes('não configurado'),
-      true,
-      'Webhook sem configuração deve retornar erro explícito de configuração'
-    )
-  }
+  assert.equal(postSemAssinatura.status, 400)
+  assert.equal(
+    String(bodySemAssinatura.error || '').includes('identificador de pagamento'),
+    true,
+    'Webhook deve rejeitar notificação sem id do pagamento'
+  )
 
-  const postAssinaturaInvalida = await fetch(`${baseUrl}/api/webhooks/pagamentos`, {
+  const postTipoIrrelevante = await fetch(`${baseUrl}/api/webhooks/pagamentos?restaurante_id=teste`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'stripe-signature': 'invalida',
     },
-    body: JSON.stringify({ teste: true }),
+    body: JSON.stringify({ type: 'ping', data: { id: '123' } }),
   })
 
-  const bodyAssinaturaInvalida = await postAssinaturaInvalida.json()
-  if (webhookConfigurado) {
-    assert.equal(postAssinaturaInvalida.status, 400)
-    assert.equal(
-      String(bodyAssinaturaInvalida.error || '').includes('Webhook Error'),
-      true,
-      'Assinatura inválida deve ser rejeitada com erro de webhook'
-    )
-  } else {
-    assert.equal(postAssinaturaInvalida.status, 500)
-  }
+  const bodyTipoIrrelevante = await postTipoIrrelevante.json()
+  assert.equal(postTipoIrrelevante.status, 200)
+  assert.equal(bodyTipoIrrelevante.received, true)
 })

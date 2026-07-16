@@ -6,6 +6,7 @@ const MP_AUTH_URL = 'https://auth.mercadopago.com/authorization';
 const MP_API_BASE = 'https://api.mercadopago.com';
 
 export type MetodoPagamentoMercadoPago = 'PIX' | 'CARTAO';
+export type AmbienteMercadoPago = 'production' | 'sandbox';
 
 export interface RestauranteIntegracaoPagamento {
   id: string;
@@ -42,6 +43,7 @@ interface PedidoMetadata {
   itens: string;
   metodoPagamento: MetodoPagamentoMercadoPago;
   restauranteId: string;
+  ambiente: AmbienteMercadoPago;
 }
 
 interface IntegracaoLinkResult {
@@ -57,13 +59,39 @@ function getEnvOrThrow(value: string | undefined, name: string): string {
 }
 
 function getMercadoPagoConfig() {
+  const ambiente = obterAmbienteMercadoPago();
+  const clientIdSandbox = process.env.MERCADO_PAGO_TEST_CLIENT_ID?.trim();
+  const clientSecretSandbox = process.env.MERCADO_PAGO_TEST_CLIENT_SECRET?.trim();
+
   return {
-    clientId: getEnvOrThrow(process.env.MERCADO_PAGO_CLIENT_ID, 'MERCADO_PAGO_CLIENT_ID'),
-    clientSecret: getEnvOrThrow(process.env.MERCADO_PAGO_CLIENT_SECRET, 'MERCADO_PAGO_CLIENT_SECRET'),
+    clientId:
+      ambiente === 'sandbox' && clientIdSandbox
+        ? clientIdSandbox
+        : getEnvOrThrow(process.env.MERCADO_PAGO_CLIENT_ID, 'MERCADO_PAGO_CLIENT_ID'),
+    clientSecret:
+      ambiente === 'sandbox' && clientSecretSandbox
+        ? clientSecretSandbox
+        : getEnvOrThrow(process.env.MERCADO_PAGO_CLIENT_SECRET, 'MERCADO_PAGO_CLIENT_SECRET'),
     redirectUri: getEnvOrThrow(process.env.MERCADO_PAGO_REDIRECT_URI, 'MERCADO_PAGO_REDIRECT_URI'),
     stateSecret: getEnvOrThrow(process.env.MERCADO_PAGO_STATE_SECRET, 'MERCADO_PAGO_STATE_SECRET'),
-    appUrl: getEnvOrThrow(process.env.NEXT_PUBLIC_APP_URL, 'NEXT_PUBLIC_APP_URL'),
   };
+}
+
+export function obterAmbienteMercadoPago(): AmbienteMercadoPago {
+  const env = (process.env.MERCADO_PAGO_ENV ?? 'production').trim().toLowerCase();
+  if (env === 'production' || env === 'sandbox') {
+    return env;
+  }
+  throw new Error('MERCADO_PAGO_ENV inválido. Use "production" ou "sandbox".');
+}
+
+export function ambienteMercadoPagoEhSandbox() {
+  return obterAmbienteMercadoPago() === 'sandbox';
+}
+
+export function obterTokenMercadoPagoTesteConfigurado() {
+  const token = process.env.MERCADO_PAGO_TEST_ACCESS_TOKEN?.trim() ?? '';
+  return token.length > 0 ? token : null;
 }
 
 function encodeBase64Url(input: string) {
@@ -312,14 +340,49 @@ export async function obterTokenMercadoPagoValido(restauranteId: string) {
   return tokens.access_token;
 }
 
+export async function obterTokenMercadoPagoCheckout(restauranteId: string) {
+  const ambiente = obterAmbienteMercadoPago();
+  const tokenTeste = obterTokenMercadoPagoTesteConfigurado();
+
+  if (ambiente === 'sandbox' && tokenTeste) {
+    return {
+      accessToken: tokenTeste,
+      origem: 'teste' as const,
+      ambiente,
+    };
+  }
+
+  return {
+    accessToken: await obterTokenMercadoPagoValido(restauranteId),
+    origem: 'integracao' as const,
+    ambiente,
+  };
+}
+
 export function montarNotificationUrlMercadoPago(appUrl: string, restauranteId: string) {
   const url = new URL('/api/webhooks/pagamentos', appUrl);
   url.searchParams.set('restaurante_id', restauranteId);
   return url.toString();
 }
 
-export function normalizarEmailPayer(email?: string | null, slug?: string, telefone?: string) {
+export function normalizarEmailPayer(
+  email?: string | null,
+  slug?: string,
+  telefone?: string,
+  ambiente: AmbienteMercadoPago = 'production'
+) {
+  if (ambiente === 'sandbox') {
+    const emailTeste = process.env.MERCADO_PAGO_TEST_BUYER_EMAIL?.trim() || email?.trim();
+    if (!emailTeste || !emailTeste.toLowerCase().endsWith('@testuser.com')) {
+      throw new Error(
+        'Sandbox do Mercado Pago exige email de comprador de teste (@testuser.com). Configure MERCADO_PAGO_TEST_BUYER_EMAIL.'
+      );
+    }
+    return emailTeste;
+  }
+
   if (email?.trim()) return email.trim();
+
   const telefoneNormalizado = telefone?.replace(/\D/g, '') || '000000000';
   const slugNormalizado = (slug || 'loja').toLowerCase().replace(/[^a-z0-9]+/g, '-');
   return `pagamento-${telefoneNormalizado}@${slugNormalizado}.local`;
@@ -331,6 +394,7 @@ export function montarMetadataPedido(params: {
   metodoPagamento: MetodoPagamentoMercadoPago;
   dadosCliente: unknown;
   itens: unknown;
+  ambiente: AmbienteMercadoPago;
 }) {
   const metadata: PedidoMetadata = {
     slug: params.slug,
@@ -338,8 +402,8 @@ export function montarMetadataPedido(params: {
     metodoPagamento: params.metodoPagamento,
     dadosCliente: JSON.stringify(params.dadosCliente),
     itens: JSON.stringify(params.itens),
+    ambiente: params.ambiente,
   };
 
   return metadata;
 }
-

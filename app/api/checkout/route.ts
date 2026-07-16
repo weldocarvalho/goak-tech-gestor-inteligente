@@ -1,11 +1,12 @@
 import { NextResponse } from 'next/server';
 import { createWebhookAdminClient } from '@/utils/supabase/webhook';
 import {
+  ambienteMercadoPagoEhSandbox,
   montarMetadataPedido,
   montarNotificationUrlMercadoPago,
   normalizarEmailPayer,
   obterIntegracaoMercadoPagoPorRestauranteId,
-  obterTokenMercadoPagoValido,
+  obterTokenMercadoPagoCheckout,
 } from '@/utils/mercado-pago';
 
 const MP_API_BASE = 'https://api.mercadopago.com';
@@ -63,12 +64,38 @@ function validarItens(itens: ItemCliente[]) {
   );
 }
 
+function obterBaseUrlPublica(request: Request) {
+  const forwardedHost = request.headers.get('x-forwarded-host');
+  const forwardedProto = request.headers.get('x-forwarded-proto');
+  const host = request.headers.get('host');
+  const appUrlEnv = process.env.NEXT_PUBLIC_APP_URL?.trim();
+
+  if (forwardedHost && forwardedProto) {
+    return `${forwardedProto}://${forwardedHost}`;
+  }
+  if (host) {
+    const local = host.includes('localhost') || host.startsWith('127.0.0.1');
+    return `${local ? 'http' : 'https'}://${host}`;
+  }
+  if (appUrlEnv) {
+    return appUrlEnv;
+  }
+
+  throw new Error('URL pública da aplicação não configurada.');
+}
+
+function urlEhPublicaHttps(url: string) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && !parsed.hostname.includes('localhost');
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(request: Request) {
   try {
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL;
-    if (!appUrl) {
-      return NextResponse.json({ error: 'URL pública da aplicação não configurada.' }, { status: 500 });
-    }
+    const appUrl = obterBaseUrlPublica(request);
 
     const body = await lerBody(request);
     const slug = String(body.slug ?? '').trim();
@@ -130,11 +157,11 @@ export async function POST(request: Request) {
     }
 
     const integracao = await obterIntegracaoMercadoPagoPorRestauranteId(restaurante.id);
-    if (!integracao || integracao.connection_status !== 'conectado') {
+    if (!ambienteMercadoPagoEhSandbox() && (!integracao || integracao.connection_status !== 'conectado')) {
       return NextResponse.json({ error: 'Mercado Pago não conectado para este restaurante.' }, { status: 409 });
     }
 
-    const accessToken = await obterTokenMercadoPagoValido(restaurante.id);
+    const { accessToken, ambiente } = await obterTokenMercadoPagoCheckout(restaurante.id);
     const notificationUrl = montarNotificationUrlMercadoPago(appUrl, restaurante.id);
     const metadata = montarMetadataPedido({
       slug,
@@ -142,8 +169,9 @@ export async function POST(request: Request) {
       metodoPagamento: paymentMethod,
       dadosCliente,
       itens,
+      ambiente,
     });
-    const emailPayer = normalizarEmailPayer(dadosCliente.email, slug, dadosCliente.telefone);
+    const emailPayer = normalizarEmailPayer(dadosCliente.email, slug, dadosCliente.telefone, ambiente);
     const externalReference = `pedido-${restaurante.id}-${Date.now()}`;
     const idempotencyKey = `${externalReference}-${paymentMethod.toLowerCase()}`;
 
@@ -172,7 +200,13 @@ export async function POST(request: Request) {
 
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(payload?.message || 'Falha ao gerar pagamento PIX.');
+        const causas = Array.isArray(payload?.cause)
+          ? payload.cause
+              .map((causa: { description?: string }) => causa?.description)
+              .filter(Boolean)
+              .join(' | ')
+          : '';
+        throw new Error(causas || payload?.message || 'Falha ao gerar pagamento PIX.');
       }
 
       const transactionData = payload?.point_of_interaction?.transaction_data ?? {};
@@ -210,7 +244,7 @@ export async function POST(request: Request) {
           pending: `${appUrl}/${slug}/checkout?pagamento=pendente`,
           failure: `${appUrl}/${slug}/checkout?pagamento=falhou`,
         },
-        auto_return: 'approved',
+        ...(urlEhPublicaHttps(appUrl) ? { auto_return: 'approved' } : {}),
         metadata,
       }),
     });
@@ -220,9 +254,13 @@ export async function POST(request: Request) {
       throw new Error(preferencePayload?.message || 'Falha ao gerar checkout com cartão.');
     }
 
+    const checkoutUrl = ambiente === 'sandbox'
+      ? (preferencePayload.sandbox_init_point ?? preferencePayload.init_point ?? '')
+      : (preferencePayload.init_point ?? preferencePayload.sandbox_init_point ?? '');
+
     return NextResponse.json({
       preference_id: preferencePayload.id,
-      checkout_url: preferencePayload.init_point ?? preferencePayload.sandbox_init_point ?? '',
+      checkout_url: checkoutUrl,
     });
   } catch (error: unknown) {
     console.error('Erro crítico na rota de checkout Mercado Pago:', error);

@@ -22,6 +22,11 @@ MERCADO_PAGO_CLIENT_ID=""
 MERCADO_PAGO_CLIENT_SECRET=""
 MERCADO_PAGO_REDIRECT_URI=""
 MERCADO_PAGO_STATE_SECRET=""
+MERCADO_PAGO_ENV="production"
+MERCADO_PAGO_TEST_ACCESS_TOKEN=""
+MERCADO_PAGO_TEST_CLIENT_ID=""
+MERCADO_PAGO_TEST_CLIENT_SECRET=""
+MERCADO_PAGO_TEST_BUYER_EMAIL=""
 HML_TEST_EMAIL="teste@restaurante.com"
 HML_TEST_PASSWORD="1234"
 HML_APP_PORT="4100"
@@ -43,6 +48,18 @@ npm run build
 ```
 
 Esses dois comandos devem estar verdes antes de publicar em produção.
+
+## Mercado Pago - produção e testes
+
+- `MERCADO_PAGO_ENV="production"`: usa integração OAuth da conta conectada do estabelecimento.
+- `MERCADO_PAGO_ENV="sandbox"` + `MERCADO_PAGO_TEST_ACCESS_TOKEN`: usa credenciais de teste do Mercado Pago para checkout/webhook sem mexer em produção.
+
+Fluxo recomendado para suíte de testes do Mercado Pago:
+1. Criar usuário **vendedor de teste** no painel Developers e copiar `access_token` para `MERCADO_PAGO_TEST_ACCESS_TOKEN`.
+2. Criar usuário **comprador de teste** no painel Developers e copiar o email dele para `MERCADO_PAGO_TEST_BUYER_EMAIL`.
+3. Definir `MERCADO_PAGO_ENV="sandbox"`.
+4. Gerar PIX/cartão no checkout e validar a persistência pelo webhook.
+5. Ao finalizar testes, voltar `MERCADO_PAGO_ENV="production"`.
 
 ## Homologação automatizada (Bloco 1)
 
